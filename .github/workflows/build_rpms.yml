@@ -1,0 +1,42 @@
+name: Build RPMs
+
+on:
+  release:
+    types: [created]
+    
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/centos/centos:stream8
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+      - name: install packages
+        run: |
+          dnf -y update
+          dnf -y install epel-release
+          dnf install -y --enablerepo=epel --enablerepo=powertools gcc make autoconf automake libtool rpm-build libtirpc-devel libblkid-devel libuuid-devel libudev-devel openssl-devel zlib-devel libaio-devel libattr-devel elfutils-libelf-devel kernel-devel python3 python3-devel python3-setuptools python3-cffi libffi-devel git ncompress libcurl-devel python3-packaging dkms gem ruby ruby-devel gcc-c++
+          dnf -y update
+          gem install package_cloud
+      - name: Configure
+        run: |
+          sh ./autogen.sh
+          ./configure
+      - name: Build RPMS
+        run: |
+          make -j $(nproc) rpm
+      - name: Upload RPMS to PackageCloud
+        env:
+          PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+        run: |
+          package_cloud push dniasoff/zfs/el/8 *.rpm          
+      - name: Upload RPMS to GitHub Release
+        uses: alexellis/upload-assets@0.2.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          asset_paths: '["*.rpm"]'
+
