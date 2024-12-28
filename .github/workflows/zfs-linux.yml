@@ -1,0 +1,156 @@
+name: Builds
+on:
+  - push
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  build:
+    name: Build
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - 22.04
+          - 24.04
+    runs-on:
+      group: prod
+    container:
+      image: ubuntu:${{ matrix.os }}
+
+    steps:
+      - name: install latest git
+        run: |
+          apt update
+          apt-get install -yq software-properties-common
+          apt-add-repository ppa:git-core/ppa
+          apt-get install -yq git
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get upgrade -y
+          apt-get -yq install \
+            debhelper \
+            devscripts \
+            dh-autoreconf \
+            dh-python \
+            dkms \
+            dpkg-dev \
+            libaio-dev \
+            libblkid-dev \
+            libcurl4-openssl-dev \
+            libelf-dev \
+            libpam0g-dev \
+            libssl-dev \
+            libtool \
+            libudev-dev \
+            lsb-release \
+            po-debconf \
+            python3-all-dev \
+            python3-cffi \
+            python3-setuptools \
+            python3-sphinx \
+            uuid-dev \
+            zlib1g-dev \
+            libtirpc-dev
+
+          apt-get -yq install dh-dkms || true
+
+      - name: Build ZFS
+        env:
+          PKGOS: ubuntu-${{ matrix.os }}
+          PKGARCH: amd64
+        run: |
+
+            [ "${PKGOS}" = "ubuntu-22.04" ] && CODENAME=jammy
+            [ "${PKGOS}" = "ubuntu-24.04" ] && CODENAME=noble
+
+            echo "$CODENAME=$CODENAME" >> "$GITHUB_ENV"
+
+            ./autogen.sh
+            ./configure
+
+            ZFSVERSION=$(cat META | grep ^Version: | awk '{print $2}')
+
+            cd contrib
+            dch -D ${CODENAME} -M -b -m "Automated ZFS build" -v ${ZFSVERSION}-$(date -u +%Y%m%d%H%M)
+            cd ..
+
+            make native-deb-utils
+
+      - name: Prepare the artifacts
+        run: |
+          mkdir out/
+          mv ../*.deb out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: out/*
+
+  upload:
+    name: Upload
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - 22.04
+          - 24.04
+    needs:
+    - build
+    runs-on:
+        group: prod
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: set branch variable
+        id: branch
+        run: |
+          if [ "$GITHUB_EVENT_NAME" == "delete" ]; then
+            BRANCH=${{ github.event.ref }}
+          else
+            BRANCH=${{ github.base_ref || github.ref_name }}
+          fi
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          if [ "${BRANCH}" == "zfs-2.2-release" ]; then
+            echo "PACKAGECLOUD_REPONAME=qcp-zfs" >> $GITHUB_ENV
+          else
+            echo "PACKAGECLOUD_REPONAME=qcp-zfs-dev" >> $GITHUB_ENV
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: upload packages
+        env:
+            PKGOS: ubuntu-${{ matrix.os }}
+            PKGARCH: ${{ matrix.arch }}
+            PACKAGECLOUD_USERNAME: dniasoff
+            PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+        run: |
+            [ "${PKGOS}" = "ubuntu-22.04" ] && CODENAME=jammy
+            [ "${PKGOS}" = "ubuntu-24.04" ] && CODENAME=noble
+
+            PACKAGECLOUD_DISTRO=ubuntu/${CODENAME}
+
+            for file in *.deb
+            do
+                PACKAGE_NAME=$file
+                echo "Pushing package: ${PACKAGE_NAME}"
+                UPLOAD_PATH="${PACKAGECLOUD_USERNAME}/${PACKAGECLOUD_REPONAME}/${PACKAGECLOUD_DISTRO}"
+                echo "To repository: ${UPLOAD_PATH}"
+                package_cloud yank --yes ${UPLOAD_PATH} ${PACKAGE_NAME} &> /dev/null || true
+                package_cloud push --yes ${UPLOAD_PATH} ${PACKAGE_NAME}
+            done
