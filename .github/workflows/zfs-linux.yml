@@ -149,7 +149,7 @@ jobs:
             do
                 PACKAGE_NAME=$file
                 echo "Pushing package: ${PACKAGE_NAME}"
-                UPLOAD_PATH="${PACKAGECLOUD_USERNAME}/${PACKAGECLOUD_REPONAME}/${PACKAGECLOUD_DISTRO}"
+                UPLOAD_PATH="qumulus/${PACKAGECLOUD_REPONAME}/${PACKAGECLOUD_DISTRO}"
                 echo "To repository: ${UPLOAD_PATH}"
                 package_cloud yank --yes ${UPLOAD_PATH} ${PACKAGE_NAME} &> /dev/null || true
                 package_cloud push --yes ${UPLOAD_PATH} ${PACKAGE_NAME}
