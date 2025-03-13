@@ -17,7 +17,6 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - 22.04
           - 24.04
     runs-on:
       group: prod
@@ -104,7 +103,6 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - 22.04
           - 24.04
     needs:
     - build
