@@ -129,9 +129,6 @@ case "$1" in
   fedora*)
     rhel
     sudo dnf install -y libunwind-devel
-
-    # Fedora 42+ moves /usr/bin/script from 'util-linux' to 'util-linux-script'
-    sudo dnf install -y util-linux-script || true
     ;;
   freebsd*)
     freebsd
