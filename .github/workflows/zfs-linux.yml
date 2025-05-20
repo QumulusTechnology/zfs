@@ -4,9 +4,14 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  RELEASE_NUMBER: 1
 
 concurrency:
-  group: ${{ github.ref }}
+  group: '${{ github.workflow }} @ ${{ github.repository }} @ ${{ github.base_ref || github.ref_name }}'
   cancel-in-progress: true
 
 jobs:
@@ -24,12 +29,25 @@ jobs:
       image: ubuntu:${{ matrix.os }}
 
     steps:
+
       - name: install latest git
         run: |
           apt update
           apt-get install -yq software-properties-common
           apt-add-repository ppa:git-core/ppa
-          apt-get install -yq git
+          apt-get install -yq git jq
+
+      - uses: QumulusTechnology/vault-setup-action@v2
+        with:
+          aws_account_data: ${{ secrets.AWS_ACCOUNT_DATA }}
+          vault_addr: ${{ secrets.VAULT_ADDR }}
+          platform: qcp
+          secrets: |
+            secret/data/qcp/global/automation-user-gpg-key private-key | GPG_PRIVATE_KEY ;
+            secret/data/qcp/global/qumulus-automation-user-docker-io-credentials token | REPO_PASSWORD ;
+            secret/data/qcp/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}/kubernetes/eu-west1/nexusrepo username | NEXUS_USERNAME ;
+            secret/data/qcp/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}/kubernetes/eu-west1/nexusrepo password | NEXUS_PASSWORD ;
+            secret/data/qcp/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}/kubernetes/eu-west1/nexusrepo url | NEXUS_URL ;
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,6 +58,7 @@ jobs:
           apt-get upgrade -y
           apt-get -yq install \
             debhelper \
+            debsigs \
             devscripts \
             dh-autoreconf \
             dh-python \
@@ -61,9 +80,17 @@ jobs:
             python3-sphinx \
             uuid-dev \
             zlib1g-dev \
-            libtirpc-dev
+            libtirpc-dev \
+            gnupg2
 
           apt-get -yq install dh-dkms || true
+
+      - name: Setup GPG
+        run: |
+          echo "$GPG_PRIVATE_KEY" | base64 -d | gpg --import
+          echo "default-cache-ttl 3600" >> ~/.gnupg/gpg-agent.conf
+          echo "max-cache-ttl 3600" >> ~/.gnupg/gpg-agent.conf
+          gpg --list-secret-keys
 
       - name: Build ZFS
         env:
@@ -79,76 +106,56 @@ jobs:
             ./autogen.sh
             ./configure
 
-            ZFSVERSION=$(cat META | grep ^Version: | awk '{print $2}')
+            ZFS_VERSION=$(cat META | grep ^Version: | awk '{print $2}')
 
             cd contrib
-            dch -D ${CODENAME} -M -b -m "Automated ZFS build" -v ${ZFSVERSION}-$(date -u +%Y%m%d%H%M)
+            dch -D ${CODENAME} -M -b -m "Qumulus Automated ZFS build" -v ${ZFS_VERSION}-${RELEASE_NUMBER}
             cd ..
 
             make native-deb-utils
 
-      - name: Prepare the artifacts
+      - name: Sign packages
         run: |
-          mkdir out/
-          mv ../*.deb out/
+          # Get the key ID in short format
+          KEY_ID=$(gpg --list-secret-keys --keyid-format SHORT | grep sec | awk '{print $2}' | cut -d'/' -f2)
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.os }}-${{ matrix.arch }}
-          path: out/*
+          debsigs --sign=origin -k $KEY_ID ../*.deb
 
-  upload:
-    name: Upload
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - 24.04
-    needs:
-    - build
-    runs-on:
-        group: prod
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: set branch variable
-        id: branch
-        run: |
-          if [ "$GITHUB_EVENT_NAME" == "delete" ]; then
-            BRANCH=${{ github.event.ref }}
-          else
-            BRANCH=${{ github.base_ref || github.ref_name }}
-          fi
-          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
-          if [ "${BRANCH}" == "zfs-2.2-release" ]; then
-            echo "PACKAGECLOUD_REPONAME=qcp-zfs" >> $GITHUB_ENV
-          else
-            echo "PACKAGECLOUD_REPONAME=qcp-zfs-dev" >> $GITHUB_ENV
-          fi
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ matrix.os }}-${{ matrix.arch }}
-
-      - name: upload packages
+      - name: upload packages to Nexus
         env:
             PKGOS: ubuntu-${{ matrix.os }}
-            PKGARCH: ${{ matrix.arch }}
-            PACKAGECLOUD_USERNAME: qumulus
-            PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+            PKGARCH: amd64
+        shell: bash
         run: |
-            [ "${PKGOS}" = "ubuntu-22.04" ] && CODENAME=jammy
-            [ "${PKGOS}" = "ubuntu-24.04" ] && CODENAME=noble
+          # Set CODENAME based on Ubuntu version
+          if [ "${PKGOS}" = "ubuntu-22.04" ]; then
+            CODENAME="jammy"
+          elif [ "${PKGOS}" = "ubuntu-24.04" ]; then
+            CODENAME="noble"
+          else
+            echo "Unsupported Ubuntu version: ${PKGOS}"
+            exit 1
+          fi
 
-            PACKAGECLOUD_DISTRO=ubuntu/${CODENAME}
+          # Set repository based on branch
+          if [ "${BRANCH}" == "main" ]; then
+            NEXUS_REPO="qcp-zfs"
+          else
+            NEXUS_REPO="qcp-zfs-dev"
+          fi
 
-            for file in *.deb
-            do
-                PACKAGE_NAME=$file
-                echo "Pushing package: ${PACKAGE_NAME}"
-                UPLOAD_PATH="${PACKAGECLOUD_USERNAME}/${PACKAGECLOUD_REPONAME}/${PACKAGECLOUD_DISTRO}"
-                echo "To repository: ${UPLOAD_PATH}"
-                package_cloud yank --yes ${UPLOAD_PATH} ${PACKAGE_NAME} &> /dev/null || true
-                package_cloud push --yes ${UPLOAD_PATH} ${PACKAGE_NAME}
-            done
+          echo "Uploading packages for ${CODENAME} to ${NEXUS_REPO}"
+
+          for file in ../*.deb
+          do
+            # Extract just the filename without the path
+            filename=$(basename "${file}")
+
+            echo "Uploading package: ${filename}"
+
+            # Use the direct repository URL without the pool structure
+            curl -v -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+                  -H "Content-Type: multipart/form-data" \
+                  --data-binary "@${file}" \
+                  "https://${NEXUS_URL}/repository/${NEXUS_REPO}/"
+          done
