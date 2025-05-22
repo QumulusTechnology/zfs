@@ -37,15 +37,23 @@ jobs:
           apt-add-repository ppa:git-core/ppa
           apt-get install -yq git jq
 
-      - uses: QumulusTechnology/vault-setup-action@v2
+      - name: Set environment
+        uses: QumulusTechnology/vault-setup-action@v3
+        with:
+          aws_account_data: ${{ secrets.AWS_ACCOUNT_DATA }}
+          vault_addr: ${{ secrets.VAULT_ADDR }}
+          platform: qcp
+
+      - name: Import Secrets
+        uses: QumulusTechnology/vault-setup-action@v3
         with:
           aws_account_data: ${{ secrets.AWS_ACCOUNT_DATA }}
           vault_addr: ${{ secrets.VAULT_ADDR }}
           platform: qcp
           secrets: |
-            secret/data/qcp/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}/kubernetes/eu-west1/nexusrepo username | NEXUS_USERNAME ;
-            secret/data/qcp/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}/kubernetes/eu-west1/nexusrepo password | NEXUS_PASSWORD ;
-            secret/data/qcp/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}/kubernetes/eu-west1/nexusrepo url | NEXUS_URL ;
+            secret/data/qcp/${{ env.ENVIRONMENT }}/kubernetes/eu-west1/nexusrepo username | NEXUS_USERNAME ;
+            secret/data/qcp/${{ env.ENVIRONMENT }}/kubernetes/eu-west1/nexusrepo password | NEXUS_PASSWORD ;
+            secret/data/qcp/${{ env.ENVIRONMENT }}/kubernetes/eu-west1/nexusrepo url | NEXUS_URL ;
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -124,51 +132,6 @@ jobs:
 
           echo "Uploading packages for ${PKGOS} to ${NEXUS_REPO} (distribution: ${DISTRIBUTION})"
 
-          # Function to delete existing package
-          delete_existing_package() {
-            local filename="$1"
-            local package_name="${filename%_*}"  # Extract package name before version
-
-            echo "Checking for existing package: ${package_name}"
-
-            # Search for existing package using Nexus Search API
-            SEARCH_RESPONSE=$(mktemp)
-            SEARCH_CODE=$(curl -s -o "${SEARCH_RESPONSE}" -w "%{http_code}" \
-                -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
-                "${NEXUS_URL}/service/rest/v1/search?repository=${NEXUS_REPO}&name=${package_name}")
-
-            if [ "${SEARCH_CODE}" = "200" ]; then
-              # Check if any items were found
-              ITEM_COUNT=$(grep -o '"items":\[' "${SEARCH_RESPONSE}" | wc -l)
-              if [ "${ITEM_COUNT}" -gt 0 ]; then
-                echo "Found existing package(s) for ${package_name}, attempting to delete..."
-
-                # Extract component IDs and delete them
-                grep -o '"id":"[^"]*"' "${SEARCH_RESPONSE}" | cut -d'"' -f4 | while read -r component_id; do
-                  if [ -n "${component_id}" ]; then
-                    echo "Deleting component ID: ${component_id}"
-                    DELETE_CODE=$(curl -s -w "%{http_code}" -o /dev/null \
-                        -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
-                        -X DELETE \
-                        "${NEXUS_URL}/service/rest/v1/components/${component_id}")
-
-                    if [ "${DELETE_CODE}" = "204" ]; then
-                      echo "✓ Successfully deleted existing component: ${component_id}"
-                    else
-                      echo "⚠ Failed to delete component ${component_id} (HTTP ${DELETE_CODE}), continuing..."
-                    fi
-                  fi
-                done
-              else
-                echo "No existing packages found for ${package_name}"
-              fi
-            else
-              echo "⚠ Could not search for existing packages (HTTP ${SEARCH_CODE}), continuing with upload..."
-            fi
-
-            rm -f "${SEARCH_RESPONSE}"
-          }
-
           # Add variables to track success/failure
           UPLOAD_SUCCESS=true
 
@@ -184,9 +147,6 @@ jobs:
             filesize=$(stat -c%s "${file}")
 
             echo "Processing package: ${filename} (size: ${filesize} bytes)"
-
-            # Delete existing package first
-            delete_existing_package "${filename}"
 
             echo "Uploading package: ${filename}"
 
