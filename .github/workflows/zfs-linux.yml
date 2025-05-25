@@ -180,3 +180,211 @@ jobs:
           else
             echo "✅ All packages uploaded successfully."
           fi
+
+
+  discover-kernels:
+    name: Discover Available Kernels
+    runs-on:
+      group: prod
+    container:
+      image: repo.eu-west1.cloudportal.app/github-actions/linstor-builder-ubuntu-24.04:v0.0.14
+      credentials:
+        username: ${{ secrets.HARBOR_REPO_USERNAME }}
+        password: ${{ secrets.HARBOR_REPO_PASSWORD }}
+    outputs:
+      kernel-matrix: ${{ steps.get-kernels.outputs.kernel-matrix }}
+    steps:
+      - name: Get available kernel versions
+        id: get-kernels
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+
+          # Get all available linux-headers packages for generic kernels
+          # Sort by version and get the last 5
+          KERNELS=$(apt-cache search '^linux-headers-[0-9].*-generic$' | \
+            grep -E 'linux-headers-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | \
+            awk '{print $1}' | \
+            sed 's/linux-headers-//' | \
+            sort -V | \
+            tail -5)
+
+          echo "Found kernel versions:"
+          echo "$KERNELS"
+
+          # Convert to JSON array for matrix
+          KERNEL_JSON=$(echo "$KERNELS" | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({kernel: ., os: "24.04", codename: "noble"})')
+
+          echo "kernel-matrix=$KERNEL_JSON" >> $GITHUB_OUTPUT
+          echo "Generated matrix: $KERNEL_JSON"
+
+  build-kernel-modules:
+    name: Build ZFS Kernel Modules
+    needs: [discover-kernels]
+    if: needs.discover-kernels.outputs.kernel-matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover-kernels.outputs.kernel-matrix) }}
+    runs-on:
+      group: prod
+    container:
+      image: ubuntu:${{ matrix.os }}
+
+    steps:
+      - name: Install latest git and dependencies
+        run: |
+          apt update
+          apt-get install -yq software-properties-common
+          apt-add-repository ppa:git-core/ppa
+          apt-get install -yq git jq
+
+      - name: Set environment
+        uses: QumulusTechnology/vault-setup-action@v3
+        with:
+          aws_account_data: ${{ secrets.AWS_ACCOUNT_DATA }}
+          vault_addr: ${{ secrets.VAULT_ADDR }}
+          platform: qcp
+
+      - name: Import Secrets
+        uses: QumulusTechnology/vault-setup-action@v3
+        with:
+          aws_account_data: ${{ secrets.AWS_ACCOUNT_DATA }}
+          vault_addr: ${{ secrets.VAULT_ADDR }}
+          platform: qcp
+          secrets: |
+            secret/data/qcp/${{ env.ENVIRONMENT }}/kubernetes/eu-west1/nexusrepo username | NEXUS_USERNAME ;
+            secret/data/qcp/${{ env.ENVIRONMENT }}/kubernetes/eu-west1/nexusrepo password | NEXUS_PASSWORD ;
+            secret/data/qcp/${{ env.ENVIRONMENT }}/kubernetes/eu-west1/nexusrepo url | NEXUS_URL ;
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kernel headers and build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get upgrade -y
+
+          # Install specific kernel headers for this matrix job
+          echo "Installing kernel headers for ${{ matrix.kernel }}"
+          apt-get install -yq linux-headers-${{ matrix.kernel }}
+
+          # Install ZFS build dependencies
+          apt-get -yq install \
+            build-essential \
+            debhelper \
+            debsigs \
+            devscripts \
+            dh-autoreconf \
+            dh-python \
+            dkms \
+            dpkg-dev \
+            libaio-dev \
+            libblkid-dev \
+            libcurl4-openssl-dev \
+            libelf-dev \
+            libpam0g-dev \
+            libssl-dev \
+            libtool \
+            libudev-dev \
+            lsb-release \
+            po-debconf \
+            python3-all-dev \
+            python3-cffi \
+            python3-setuptools \
+            python3-sphinx \
+            uuid-dev \
+            zlib1g-dev \
+            libtirpc-dev \
+            gnupg2
+
+          apt-get -yq install dh-dkms || true
+
+      - name: Build ZFS kernel modules for specific kernel
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel }}
+          CODENAME: ${{ matrix.codename }}
+        run: |
+          echo "Building ZFS modules for kernel version: ${KERNEL_VERSION}"
+
+          ./autogen.sh
+
+          # Configure with specific kernel version
+          ./configure \
+            --with-linux=/usr/src/linux-headers-${KERNEL_VERSION} \
+            --with-linux-obj=/usr/src/linux-headers-${KERNEL_VERSION}
+
+          ZFS_VERSION=$(cat META | grep ^Version: | awk '{print $2}')
+          echo "ZFS_VERSION=${ZFS_VERSION}" >> $GITHUB_ENV
+
+          # Build kernel modules
+          make -j$(nproc)
+
+          # Create kernel-specific package
+          cd contrib
+          dch -D ${CODENAME} -M -b -m "Qumulus Automated ZFS kernel module build for ${KERNEL_VERSION}" \
+              -v ${ZFS_VERSION}-${RELEASE_NUMBER}
+          cd ..
+
+          # Build the packages with explicit kernel version override
+          KVERS=${KERNEL_VERSION} make native-deb-kmod
+
+      - name: Upload kernel modules to Nexus
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel }}
+          CODENAME: ${{ matrix.codename }}
+        run: |
+          # Set distribution name
+          DISTRIBUTION="ubuntu-${CODENAME}"
+
+          # Set repository based on branch (same as main build)
+          if [ "${BRANCH}" = "main" ]; then
+            NEXUS_REPO="qcp-zfs-${DISTRIBUTION}"
+          else
+            NEXUS_REPO="qcp-zfs-${BRANCH}-${DISTRIBUTION}"
+          fi
+
+          echo "Uploading kernel modules for ${KERNEL_VERSION} to ${NEXUS_REPO} (same repo as utilities)"
+
+          UPLOAD_SUCCESS=true
+
+          # Upload kernel module packages
+          for file in ../*.deb; do
+            if [ ! -f "${file}" ]; then
+              echo "No kernel module .deb files found"
+              continue
+            fi
+
+            filename=$(basename "${file}")
+            filesize=$(stat -c%s "${file}")
+
+            echo "Processing kernel module package: ${filename} (size: ${filesize} bytes)"
+
+            # Use temp file for response
+            HTTP_RESPONSE=$(mktemp)
+            HTTP_CODE=$(curl -s -S -o "${HTTP_RESPONSE}" -w "%{http_code}" \
+                  -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+                  --fail-with-body \
+                  -H "Content-Type: application/octet-stream" \
+                  --data-binary "@${file}" \
+                  "${NEXUS_URL}/repository/${NEXUS_REPO}/")
+            CURL_EXIT=$?
+
+            if [ ${CURL_EXIT} -ne 0 ] || [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+              echo "ERROR: Failed to upload ${filename} - HTTP Status: ${HTTP_CODE}"
+              echo "Error response:"
+              cat "${HTTP_RESPONSE}" | head -10
+              UPLOAD_SUCCESS=false
+            else
+              echo "✓ Successfully uploaded ${filename}"
+            fi
+
+            rm -f "${HTTP_RESPONSE}"
+          done
+
+          if [ "${UPLOAD_SUCCESS}" = "false" ]; then
+            echo "❌ One or more kernel module uploads failed. Job will be marked as failed."
+            exit 1
+          else
+            echo "✅ All kernel modules uploaded successfully for ${KERNEL_VERSION}."
+          fi
